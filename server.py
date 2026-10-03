@@ -7,6 +7,7 @@ import re
 import sqlite3
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +19,13 @@ DB = Path(os.environ.get('DATABASE_PATH', ROOT / 'study.sqlite3'))
 ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN', '')
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
 PORT = int(os.environ.get('PORT', '8080'))
+ADMIN_COOKIE = 'study_admin'
+ADMIN_SESSION_SECONDS = 12 * 60 * 60
+
+
+def admin_session(expiry):
+    signature = hmac.new(ADMIN_TOKEN.encode(), f'admin:{expiry}'.encode(), hashlib.sha256).hexdigest()
+    return f'{expiry}.{signature}'
 
 
 def connect():
@@ -92,13 +100,38 @@ def ai_answer(question, passages):
 
 
 class Handler(BaseHTTPRequestHandler):
-    def send_json(self, status, data):
+    def send_json(self, status, data, cookie=None):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Cache-Control', 'no-store')
+        if cookie:
+            self.send_header('Set-Cookie', cookie)
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_html(self, filename):
+        body = (ROOT / filename).read_bytes()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def is_admin(self):
+        if not ADMIN_TOKEN:
+            return False
+        cookies = dict(part.strip().split('=', 1) for part in self.headers.get('Cookie', '').split(';') if '=' in part)
+        value = cookies.get(ADMIN_COOKIE, '')
+        try:
+            expiry_text, signature = value.split('.', 1)
+            expiry = int(expiry_text)
+        except ValueError:
+            return False
+        return expiry > time.time() and hmac.compare_digest(value, admin_session(expiry))
 
     def read_json(self, limit=15_000_000):
         size = int(self.headers.get('Content-Length', '0'))
@@ -111,13 +144,9 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == '/health':
             return self.send_json(200, {'status': 'ok'})
         if url.path == '/':
-            body = (ROOT / 'index.html').read_bytes()
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
+            return self.send_html('index.html')
+        if url.path == '/admin':
+            return self.send_html('admin.html' if self.is_admin() else 'admin-login.html')
         if url.path == '/api/subjects':
             with connect() as db:
                 rows = db.execute('SELECT subject, COUNT(*) count FROM (SELECT subject FROM questions UNION ALL SELECT subject FROM seed_questions) GROUP BY subject ORDER BY subject').fetchall()
@@ -135,9 +164,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             path = urlparse(self.path).path
-            if path == '/api/admin/upload':
-                if not ADMIN_TOKEN or not hmac.compare_digest(self.headers.get('X-Admin-Token', ''), ADMIN_TOKEN):
+            if path == '/api/admin/login':
+                data = self.read_json(2000)
+                if not ADMIN_TOKEN:
+                    return self.send_json(503, {'error': 'Доступ администратора не настроен на сервере'})
+                if not hmac.compare_digest(str(data.get('token', '')), ADMIN_TOKEN):
                     return self.send_json(403, {'error': 'Неверный код администратора'})
+                expiry = int(time.time()) + ADMIN_SESSION_SECONDS
+                cookie = f'{ADMIN_COOKIE}={admin_session(expiry)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={ADMIN_SESSION_SECONDS}'
+                return self.send_json(200, {'ok': True}, cookie)
+            if path == '/api/admin/logout':
+                return self.send_json(200, {'ok': True}, f'{ADMIN_COOKIE}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0')
+            if path == '/api/admin/upload':
+                if not self.is_admin():
+                    return self.send_json(403, {'error': 'Войдите как администратор'})
                 data = self.read_json()
                 subject = normalize(str(data.get('subject', '')))[:100]
                 raw = base64.b64decode(data.get('pdf', ''), validate=True)
