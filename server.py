@@ -27,8 +27,18 @@ def connect():
     db.row_factory = sqlite3.Row
     db.execute('CREATE TABLE IF NOT EXISTS questions (id INTEGER PRIMARY KEY, subject TEXT NOT NULL, question TEXT NOT NULL, options TEXT NOT NULL, answer INTEGER NOT NULL, explanation TEXT NOT NULL DEFAULT "", UNIQUE(subject, question))')
     db.execute('CREATE TABLE IF NOT EXISTS passages (id INTEGER PRIMARY KEY, subject TEXT NOT NULL, text TEXT NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS seed_questions (source_key TEXT PRIMARY KEY, subject TEXT NOT NULL, kind TEXT NOT NULL, question TEXT NOT NULL, options TEXT NOT NULL, answer INTEGER NOT NULL, answer_text TEXT NOT NULL)')
     db.commit()
     return db
+
+
+def import_seed():
+    with connect() as db:
+        for seed_file in sorted(ROOT.glob('seed_*.json')):
+            items = json.loads(seed_file.read_text(encoding='utf-8'))
+            db.executemany('INSERT INTO seed_questions(source_key, subject, kind, question, options, answer, answer_text) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source_key) DO UPDATE SET subject=excluded.subject, kind=excluded.kind, question=excluded.question, options=excluded.options, answer=excluded.answer, answer_text=excluded.answer_text',
+                [(x['source_key'], x['subject'], x['kind'], x['question'], json.dumps(x['options'], ensure_ascii=False), x['answer'], x['answer_text']) for x in items])
+        db.commit()
 
 
 def normalize(text):
@@ -110,13 +120,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if url.path == '/api/subjects':
             with connect() as db:
-                rows = db.execute('SELECT subject, COUNT(*) count FROM questions GROUP BY subject ORDER BY subject').fetchall()
+                rows = db.execute('SELECT subject, COUNT(*) count FROM (SELECT subject FROM questions UNION ALL SELECT subject FROM seed_questions) GROUP BY subject ORDER BY subject').fetchall()
             return self.send_json(200, {'subjects': [dict(r) for r in rows]})
         if url.path == '/api/questions':
             args = parse_qs(url.query)
             subject = (args.get('subject') or [''])[0][:100]
+            if not subject:
+                return self.send_json(400, {'error': 'Выберите раздел теста'})
             with connect() as db:
-                rows = db.execute('SELECT id, subject, question, options FROM questions WHERE (? = "" OR subject = ?) ORDER BY RANDOM() LIMIT 20', (subject, subject)).fetchall()
+                rows = db.execute('SELECT * FROM (SELECT CAST(id AS TEXT) id, subject, question, options, "single" kind FROM questions WHERE subject = ? UNION ALL SELECT source_key id, subject, question, options, kind FROM seed_questions WHERE subject = ?) ORDER BY RANDOM() LIMIT 20', (subject, subject)).fetchall()
             return self.send_json(200, {'questions': [{**dict(r), 'options': json.loads(r['options'])} for r in rows]})
         self.send_json(404, {'error': 'Не найдено'})
 
@@ -153,19 +165,24 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/answer':
                 data = self.read_json(10000)
                 question = normalize(str(data.get('question', '')))[:1000]
+                subject = normalize(str(data.get('subject', '')))[:100]
                 if len(question) < 3:
                     raise ValueError('Введите вопрос')
+                if not subject:
+                    raise ValueError('Выберите раздел')
                 with connect() as db:
-                    rows = db.execute('SELECT * FROM questions').fetchall()
+                    rows = db.execute('SELECT * FROM questions WHERE subject = ?', (subject,)).fetchall()
+                    seed_rows = db.execute('SELECT * FROM seed_questions WHERE subject = ?', (subject,)).fetchall()
                     words = set(re.findall(r'\w{3,}', question.casefold()))
-                    ranked = sorted(rows, key=lambda r: len(words & set(re.findall(r'\w{3,}', r['question'].casefold()))) / max(len(words), 1), reverse=True)
+                    ranked = sorted([*rows, *seed_rows], key=lambda r: len(words & set(re.findall(r'\w{3,}', r['question'].casefold()))) / max(len(words), 1), reverse=True)
                     match = ranked[0] if ranked else None
                     score = len(words & set(re.findall(r'\w{3,}', match['question'].casefold()))) / max(len(words), 1) if match else 0
-                    passages = db.execute('SELECT subject, text FROM passages').fetchall()
+                    passages = db.execute('SELECT subject, text FROM passages WHERE subject = ?', (subject,)).fetchall()
                     passages = sorted(passages, key=lambda p: len(words & set(re.findall(r'\w{3,}', p['text'].casefold()))), reverse=True)[:5]
                 if match and score >= .55:
                     options = json.loads(match['options'])
-                    return self.send_json(200, {'type': 'database', 'answer': options[match['answer']], 'question': match['question'], 'subject': match['subject'], 'score': round(score, 2)})
+                    answer = match['answer_text'] if 'answer_text' in match.keys() else options[match['answer']]
+                    return self.send_json(200, {'type': 'database', 'answer': answer, 'question': match['question'], 'subject': match['subject'], 'score': round(score, 2)})
                 if not passages:
                     return self.send_json(200, {'type': 'none', 'answer': 'В базе пока нет подходящих материалов.'})
                 answer = ai_answer(question, passages)
@@ -175,10 +192,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/check':
                 data = self.read_json(2000)
                 with connect() as db:
-                    row = db.execute('SELECT answer, explanation FROM questions WHERE id = ?', (data.get('id'),)).fetchone()
+                    item_id = str(data.get('id', ''))
+                    if ':' in item_id:
+                        row = db.execute('SELECT answer, answer_text, kind FROM seed_questions WHERE source_key = ?', (item_id,)).fetchone()
+                    else:
+                        row = db.execute('SELECT answer, explanation FROM questions WHERE id = ?', (item_id,)).fetchone()
                 if not row:
                     return self.send_json(404, {'error': 'Вопрос не найден'})
-                return self.send_json(200, {'correct': data.get('answer') == row['answer'], 'answer': row['answer'], 'explanation': row['explanation']})
+                return self.send_json(200, {'correct': data.get('answer') == row['answer'], 'answer': row['answer'], 'explanation': row['answer_text'] if 'answer_text' in row.keys() else row['explanation']})
             self.send_json(404, {'error': 'Не найдено'})
         except (ValueError, KeyError, json.JSONDecodeError) as e:
             self.send_json(400, {'error': str(e)})
@@ -190,5 +211,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == '__main__':
-    connect().close()
+    import_seed()
     ThreadingHTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
