@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import re
 import sqlite3
 import subprocess
@@ -51,6 +52,33 @@ def import_seed():
 
 def normalize(text):
     return re.sub(r'\s+', ' ', text).strip()
+
+
+def answer_pairs(text, kind):
+    """Split Moodle's printed answer into the original rows and their keys."""
+    parts = text.split('→')
+    if len(parts) < 3:
+        raise ValueError('В задании нет списка элементов')
+    prompts = [parts[0].strip()]
+    keys = []
+    for part in parts[1:-1]:
+        if kind == 'ordering':
+            match = re.fullmatch(r'\s*(\d+),\s*(.+?)\s*', part)
+            if not match:
+                raise ValueError('Не удалось прочитать порядок элементов')
+            key, prompt = match.groups()
+        else:
+            key, separator, prompt = part.rpartition(', ')
+            if not separator:
+                raise ValueError('Не удалось прочитать пары соответствия')
+        keys.append(key.strip())
+        prompts.append(prompt.strip())
+    keys.append(parts[-1].strip())
+    if not all(prompts + keys):
+        raise ValueError('В задании есть пустые элементы')
+    if kind == 'ordering' and sorted(map(int, keys)) != list(range(1, len(keys) + 1)):
+        raise ValueError('Неверная нумерация последовательности')
+    return prompts, keys
 
 
 def extract_questions(text):
@@ -157,8 +185,20 @@ class Handler(BaseHTTPRequestHandler):
             if not subject:
                 return self.send_json(400, {'error': 'Выберите раздел теста'})
             with connect() as db:
-                rows = db.execute('SELECT * FROM (SELECT CAST(id AS TEXT) id, subject, question, options, "single" kind FROM questions WHERE subject = ? UNION ALL SELECT source_key id, subject, question, options, kind FROM seed_questions WHERE subject = ?) ORDER BY RANDOM() LIMIT 20', (subject, subject)).fetchall()
-            return self.send_json(200, {'questions': [{**dict(r), 'options': json.loads(r['options'])} for r in rows]})
+                rows = db.execute('SELECT * FROM (SELECT CAST(id AS TEXT) id, subject, question, options, "single" kind, "" answer_text FROM questions WHERE subject = ? UNION ALL SELECT source_key id, subject, question, options, kind, answer_text FROM seed_questions WHERE subject = ?) ORDER BY RANDOM() LIMIT 20', (subject, subject)).fetchall()
+            questions = []
+            for row in rows:
+                item = {key: row[key] for key in ('id', 'subject', 'question', 'kind')}
+                if row['kind'] in ('matching', 'ordering'):
+                    prompts, keys = answer_pairs(row['answer_text'], row['kind'])
+                    item['options'] = prompts
+                    if row['kind'] == 'matching':
+                        item['choices'] = list(keys)
+                        random.shuffle(item['choices'])
+                else:
+                    item['options'] = json.loads(row['options'])
+                questions.append(item)
+            return self.send_json(200, {'questions': questions})
         self.send_json(404, {'error': 'Не найдено'})
 
     def do_POST(self):
@@ -230,7 +270,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, {'type': 'ai', 'answer': answer, 'subjects': list(dict.fromkeys(p['subject'] for p in passages))})
                 return self.send_json(200, {'type': 'excerpt', 'answer': passages[0]['text'][:650], 'subject': passages[0]['subject']})
             if path == '/api/check':
-                data = self.read_json(2000)
+                data = self.read_json(10000)
                 with connect() as db:
                     item_id = str(data.get('id', ''))
                     if ':' in item_id:
@@ -239,6 +279,19 @@ class Handler(BaseHTTPRequestHandler):
                         row = db.execute('SELECT answer, explanation FROM questions WHERE id = ?', (item_id,)).fetchone()
                 if not row:
                     return self.send_json(404, {'error': 'Вопрос не найден'})
+                if 'kind' in row.keys() and row['kind'] in ('matching', 'ordering'):
+                    prompts, keys = answer_pairs(row['answer_text'], row['kind'])
+                    if row['kind'] == 'ordering':
+                        correct_answer = sorted(range(len(prompts)), key=lambda i: int(keys[i]))
+                        given = data.get('answer')
+                        valid = isinstance(given, list) and len(given) == len(prompts) and all(type(v) is int for v in given) and sorted(given) == list(range(len(prompts)))
+                    else:
+                        correct_answer = keys
+                        given = data.get('answer')
+                        valid = isinstance(given, list) and len(given) == len(prompts) and all(isinstance(v, str) for v in given)
+                    if not valid:
+                        raise ValueError('Сначала расставьте все элементы')
+                    return self.send_json(200, {'correct': given == correct_answer, 'answer': correct_answer, 'explanation': row['answer_text']})
                 return self.send_json(200, {'correct': data.get('answer') == row['answer'], 'answer': row['answer'], 'explanation': row['answer_text'] if 'answer_text' in row.keys() else row['explanation']})
             self.send_json(404, {'error': 'Не найдено'})
         except (ValueError, KeyError, json.JSONDecodeError) as e:
