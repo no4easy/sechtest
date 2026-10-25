@@ -33,7 +33,7 @@ def extract(source, subject, source_id):
         body, raw_answer = block.split('Правильный ответ:', 1)
         answer_text = clean(raw_answer.split('\f', 1)[0])
         # The review page can end with a new test header after the answer.
-        answer_text = re.split(r'Личный кабинет\s*/|Тест начат\s+|◀', answer_text)[0].strip()
+        answer_text = re.split(r'Личный кабинет\s*/|Тест начат\s+|[◀◄]', answer_text)[0].strip()
         single = 'Выберите один ответ:' in body
         if single:
             stem, variants = body.split('Выберите один ответ:', 1)
